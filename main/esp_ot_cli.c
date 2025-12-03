@@ -70,7 +70,7 @@ void handleUdpReceive(void *aContext, otMessage *aMessage, const otMessageInfo *
 }
 
 // --- 2. Helper Function to Send (Modified for Unicast) ---
-void send_command_helper(void)
+/*void send_command_helper(void)
 {
     otInstance *instance = esp_openthread_get_instance();
     otMessage *message = NULL;
@@ -115,6 +115,40 @@ void send_command_helper(void)
     {
         ESP_LOGW("APP", "Cannot send to MTD yet - Waiting for 'mtd button' message...");
     }
+}*/
+
+// Change function signature to accept the payload string
+void send_command_helper(const char *command_string)
+{
+    otInstance *instance = esp_openthread_get_instance();
+    otMessage *message = NULL;
+    otMessageInfo messageInfo;
+    otError error;
+
+    // Use the dynamic string passed to the function
+    const char *payload_mtd = command_string;
+
+    // We only send if we have heard from the MTD at least once.
+    if (sHasMtdAddress)
+    {
+        message = otUdpNewMessage(instance, NULL);
+        if (message) {
+            (void)otMessageAppend(message, payload_mtd, strlen(payload_mtd));
+            
+            memset(&messageInfo, 0, sizeof(messageInfo));
+            // USE THE SAVED UNICAST ADDRESS
+            messageInfo.mPeerAddr = sMtdAddress; 
+            messageInfo.mPeerPort = 234; 
+
+            error = otUdpSend(instance, &sUdpSocket, message, &messageInfo);
+            if (error == OT_ERROR_NONE) {
+                ESP_LOGI("APP", "Sent Command: %s", payload_mtd);
+            } else {
+                otMessageFree(message);
+                ESP_LOGE("APP", "Failed to send: %d", error);
+            }
+        }
+    }
 }
 
 // --- 3. FreeRTOS Timer Callback ---
@@ -122,7 +156,7 @@ void vPeriodicTimerCallback(TimerHandle_t xTimer)
 {
     if (esp_openthread_lock_acquire(portMAX_DELAY))
     {
-        send_command_helper();
+        send_command_helper("LED:1");
         esp_openthread_lock_release();
     }
 }

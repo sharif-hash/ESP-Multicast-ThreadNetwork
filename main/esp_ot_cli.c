@@ -39,54 +39,57 @@
 
 #define TAG "ot_esp_cli"
 
-#define MAX_MTD_COUNT 10  // Max number of MTDs to remember
+#define MAX_MTD_COUNT 10
+#define MY_TARGET_BLE_MAC "AABBCCDDEEFF" // Your BLE Target
 
 static otUdpSocket sUdpSocket;
 static TimerHandle_t s_periodic_timer;
 
-// --- GLOBAL VARIABLES FOR UNICAST ---
+// --- GLOBAL VARIABLES FOR MULTI-UNICAST ---
 static otIp6Address sMtdList[MAX_MTD_COUNT]; // List of addresses
 static int sMtdCount = 0;                    // How many we found so far
-// ------------------------------------
+// ------------------------------------------
 
-// --- 1. UDP Receive Handler ---
-// We listen for "mtd button". If we hear it, we save the sender's address.
+// --- 1. UDP Receive Handler (Consolidated) ---
 void handleUdpReceive(void *aContext, otMessage *aMessage, const otMessageInfo *aMessageInfo)
 {
     uint8_t buf[64];
     uint16_t length = otMessageRead(aMessage, otMessageGetOffset(aMessage), buf, sizeof(buf) - 1);
     buf[length] = '\0';
 
-    // FIX: Access mFields.m16[7] directly
-    ESP_LOGI("UDP", "Received: %s from :%04x", buf, aMessageInfo->mPeerAddr.mFields.m16[7]);
+    ESP_LOGI("UDP", "Received: %s", buf);
 
-    if (strncmp((char *)buf, "mtd button", 10) == 0)
+    // --- LOGIC: If MTD sends "REQ_MAC", we reply with "SET_MAC..." ---
+    if (strncmp((char *)buf, "REQ_MAC", 7) == 0)
     {
-        // Check if we already have this address in our list
-        bool isNew = true;
-        for (int i = 0; i < sMtdCount; i++)
-        {
-            if (otIp6IsAddressEqual(&sMtdList[i], &aMessageInfo->mPeerAddr))
-            {
-                isNew = false;
-                break;
-            }
-        }
+        ESP_LOGI("APP", "MTD requested MAC. Sending Reply...");
 
-        // If it's new, add it to the list
-        if (isNew)
+        // 1. Prepare the response (SET_MAC : Index : MAC)
+        // Change "AABBCCDDEEFF" to your actual BLE MAC address
+        char responsePayload[32];
+        snprintf(responsePayload, sizeof(responsePayload), "SET_MAC:0:%s", "7CD9F41B47EB");
+
+        // 2. Send Unicast Reply
+        otInstance *instance = esp_openthread_get_instance();
+        otMessage *replyMsg = otUdpNewMessage(instance, NULL);
+        if (replyMsg)
         {
-            if (sMtdCount < MAX_MTD_COUNT)
-            {
-                sMtdList[sMtdCount] = aMessageInfo->mPeerAddr;
-                sMtdCount++;
-                ESP_LOGI("APP", "New MTD Found! Total: %d", sMtdCount);
-            }
-            else
-            {
-                ESP_LOGW("APP", "MTD List Full! Cannot add new device.");
-            }
+            (void)otMessageAppend(replyMsg, responsePayload, strlen(responsePayload));
+            
+            otMessageInfo replyInfo;
+            memset(&replyInfo, 0, sizeof(replyInfo));
+            // Reply specifically to the device that asked
+            replyInfo.mPeerAddr = aMessageInfo->mPeerAddr; 
+            replyInfo.mPeerPort = 234; // MTD Port
+
+            (void)otUdpSend(instance, &sUdpSocket, replyMsg, &replyInfo);
+            ESP_LOGI("APP", "Sent Reply: %s", responsePayload);
         }
+    }
+    // (Optional) Keep the old registration logic if you still want it
+    else if (strncmp((char *)buf, "mtd button", 10) == 0)
+    {
+        ESP_LOGI("APP", "MTD Registered (Button Press)");
     }
 }
 
@@ -140,11 +143,11 @@ void send_command_helper(const char *command_string)
 // --- 3. FreeRTOS Timer Callback ---
 void vPeriodicTimerCallback(TimerHandle_t xTimer)
 {
-    if (esp_openthread_lock_acquire(portMAX_DELAY))
+/*    if (esp_openthread_lock_acquire(portMAX_DELAY))
     {
         send_command_helper("LED:1");
         esp_openthread_lock_release();
-    }
+    }*/
 }
 
 // --- 4. Initialization Function ---

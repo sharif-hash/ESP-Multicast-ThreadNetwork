@@ -39,12 +39,14 @@
 
 #define TAG "ot_esp_cli"
 
+#define MAX_MTD_COUNT 10  // Max number of MTDs to remember
+
 static otUdpSocket sUdpSocket;
 static TimerHandle_t s_periodic_timer;
 
 // --- GLOBAL VARIABLES FOR UNICAST ---
-static otIp6Address sMtdAddress;   // Store the MTD's address here
-static bool sHasMtdAddress = false; // Flag to check if we found the MTD
+static otIp6Address sMtdList[MAX_MTD_COUNT]; // List of addresses
+static int sMtdCount = 0;                    // How many we found so far
 // ------------------------------------
 
 // --- 1. UDP Receive Handler ---
@@ -55,67 +57,41 @@ void handleUdpReceive(void *aContext, otMessage *aMessage, const otMessageInfo *
     uint16_t length = otMessageRead(aMessage, otMessageGetOffset(aMessage), buf, sizeof(buf) - 1);
     buf[length] = '\0';
 
-    // FIX: Access mFields.m16[7] directly (Index 7 is the last 16-bit chunk of the address)
-    ESP_LOGI("UDP", "Received message: %s from IP ending in :%04x", buf, 
-             aMessageInfo->mPeerAddr.mFields.m16[7]);
+    // FIX: Access mFields.m16[7] directly
+    ESP_LOGI("UDP", "Received: %s from :%04x", buf, aMessageInfo->mPeerAddr.mFields.m16[7]);
 
-    // Check if this is the MTD (matches logic in sleepy-ftd.c)
     if (strncmp((char *)buf, "mtd button", 10) == 0)
     {
-        // SAVE THE ADDRESS
-        sMtdAddress = aMessageInfo->mPeerAddr;
-        sHasMtdAddress = true;
-        ESP_LOGI("APP", "Captured MTD Address! Will reply via Unicast.");
+        // Check if we already have this address in our list
+        bool isNew = true;
+        for (int i = 0; i < sMtdCount; i++)
+        {
+            if (otIp6IsAddressEqual(&sMtdList[i], &aMessageInfo->mPeerAddr))
+            {
+                isNew = false;
+                break;
+            }
+        }
+
+        // If it's new, add it to the list
+        if (isNew)
+        {
+            if (sMtdCount < MAX_MTD_COUNT)
+            {
+                sMtdList[sMtdCount] = aMessageInfo->mPeerAddr;
+                sMtdCount++;
+                ESP_LOGI("APP", "New MTD Found! Total: %d", sMtdCount);
+            }
+            else
+            {
+                ESP_LOGW("APP", "MTD List Full! Cannot add new device.");
+            }
+        }
     }
 }
 
 // --- 2. Helper Function to Send (Modified for Unicast) ---
-/*void send_command_helper(void)
-{
-    otInstance *instance = esp_openthread_get_instance();
-    otMessage *message = NULL;
-    otMessageInfo messageInfo;
-    otError error;
-    
-    // A. Send Multicast to FTD (Port 123) - This usually works for routers
-    const char *payload_ftd = "FTD message";
-    message = otUdpNewMessage(instance, NULL);
-    if (message) {
-        (void)otMessageAppend(message, payload_ftd, strlen(payload_ftd));
-        memset(&messageInfo, 0, sizeof(messageInfo));
-        (void)otIp6AddressFromString("ff03::1", &messageInfo.mPeerAddr);
-        messageInfo.mPeerPort = 123; 
-        (void)otUdpSend(instance, &sUdpSocket, message, &messageInfo);
-    }
 
-    // B. Send UNICAST to Sleepy MTD (Port 234)
-    // We only send if we have heard from the MTD at least once.
-    if (sHasMtdAddress)
-    {
-        const char *payload_mtd = "MTD message";
-        message = otUdpNewMessage(instance, NULL);
-        if (message) {
-            (void)otMessageAppend(message, payload_mtd, strlen(payload_mtd));
-            
-            memset(&messageInfo, 0, sizeof(messageInfo));
-            // USE THE SAVED UNICAST ADDRESS
-            messageInfo.mPeerAddr = sMtdAddress; 
-            messageInfo.mPeerPort = 234; 
-
-            error = otUdpSend(instance, &sUdpSocket, message, &messageInfo);
-            if (error == OT_ERROR_NONE) {
-                ESP_LOGI("APP", "Sent UNICAST to MTD");
-            } else {
-                otMessageFree(message);
-                ESP_LOGE("APP", "Failed to send unicast: %d", error);
-            }
-        }
-    }
-    else
-    {
-        ESP_LOGW("APP", "Cannot send to MTD yet - Waiting for 'mtd button' message...");
-    }
-}*/
 
 // Change function signature to accept the payload string
 void send_command_helper(const char *command_string)
@@ -125,29 +101,39 @@ void send_command_helper(const char *command_string)
     otMessageInfo messageInfo;
     otError error;
 
-    // Use the dynamic string passed to the function
-    const char *payload_mtd = command_string;
+    // 1. Send to Sleepy FTD (Multicast still works fine for Router/FTD)
+    // ... (Keep your existing FTD multicast code here if you want) ...
 
-    // We only send if we have heard from the MTD at least once.
-    if (sHasMtdAddress)
+    // 2. Send UNICAST to ALL Sleepy MTDs
+    if (sMtdCount > 0)
     {
-        message = otUdpNewMessage(instance, NULL);
-        if (message) {
-            (void)otMessageAppend(message, payload_mtd, strlen(payload_mtd));
-            
-            memset(&messageInfo, 0, sizeof(messageInfo));
-            // USE THE SAVED UNICAST ADDRESS
-            messageInfo.mPeerAddr = sMtdAddress; 
-            messageInfo.mPeerPort = 234; 
+        ESP_LOGI("APP", "Sending to %d MTDs...", sMtdCount);
 
-            error = otUdpSend(instance, &sUdpSocket, message, &messageInfo);
-            if (error == OT_ERROR_NONE) {
-                ESP_LOGI("APP", "Sent Command: %s", payload_mtd);
-            } else {
-                otMessageFree(message);
-                ESP_LOGE("APP", "Failed to send: %d", error);
+        // Loop through every known MTD
+        for (int i = 0; i < sMtdCount; i++)
+        {
+            message = otUdpNewMessage(instance, NULL);
+            if (message) {
+                (void)otMessageAppend(message, command_string, strlen(command_string));
+                
+                memset(&messageInfo, 0, sizeof(messageInfo));
+                
+                // Set Destination to the saved address from the list
+                messageInfo.mPeerAddr = sMtdList[i]; 
+                messageInfo.mPeerPort = 234; 
+
+                error = otUdpSend(instance, &sUdpSocket, message, &messageInfo);
+                
+                if (error != OT_ERROR_NONE) {
+                    otMessageFree(message);
+                    ESP_LOGE("APP", "Failed to send to MTD #%d", i);
+                }
             }
         }
+    }
+    else
+    {
+        ESP_LOGW("APP", "No MTDs found yet. Press button on MTDs to register.");
     }
 }
 

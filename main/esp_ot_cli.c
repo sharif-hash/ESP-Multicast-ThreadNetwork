@@ -51,25 +51,29 @@ static int sMtdCount = 0;                    // How many we found so far
 // ------------------------------------------
 
 // --- 1. UDP Receive Handler (Consolidated) ---
+// Helper to convert byte to hex digit
+char hexDigit(uint8_t nibble) {
+    return (nibble < 10) ? ('0' + nibble) : ('A' + nibble - 10);
+}
+
 void handleUdpReceive(void *aContext, otMessage *aMessage, const otMessageInfo *aMessageInfo)
 {
     uint8_t buf[64];
     uint16_t length = otMessageRead(aMessage, otMessageGetOffset(aMessage), buf, sizeof(buf) - 1);
-    buf[length] = '\0';
+    buf[length] = '\0'; // Safety null-termination
 
-    ESP_LOGI("UDP", "Received: %s", buf);
-
-    // --- LOGIC: If MTD sends "REQ_MAC", we reply with "SET_MAC..." ---
-    if (strncmp((char *)buf, "REQ_MAC", 7) == 0)
+    // --- CASE 1: Handle Request ("REQ_MAC") ---
+    // If the packet text starts with "REQ_MAC"
+    if (length >= 7 && strncmp((char *)buf, "REQ_MAC", 7) == 0)
     {
-        ESP_LOGI("APP", "MTD requested MAC. Sending Reply...");
+        ESP_LOGI("APP", "Received Request: REQ_MAC");
 
-        // 1. Prepare the response (SET_MAC : Index : MAC)
-        // Change "AABBCCDDEEFF" to your actual BLE MAC address
+        // Prepare Response: "SET_MAC:0:YOUR_TARGET_MAC"
+        // CHANGE THIS MAC ADDRESS TO YOUR REAL TARGET
         char responsePayload[32];
         snprintf(responsePayload, sizeof(responsePayload), "SET_MAC:0:%s", "7CD9F41B47EB");
 
-        // 2. Send Unicast Reply
+        // Send Reply
         otInstance *instance = esp_openthread_get_instance();
         otMessage *replyMsg = otUdpNewMessage(instance, NULL);
         if (replyMsg)
@@ -78,24 +82,42 @@ void handleUdpReceive(void *aContext, otMessage *aMessage, const otMessageInfo *
             
             otMessageInfo replyInfo;
             memset(&replyInfo, 0, sizeof(replyInfo));
-            // Reply specifically to the device that asked
-            replyInfo.mPeerAddr = aMessageInfo->mPeerAddr; 
+            replyInfo.mPeerAddr = aMessageInfo->mPeerAddr; // Reply to sender
             replyInfo.mPeerPort = 234; // MTD Port
 
             (void)otUdpSend(instance, &sUdpSocket, replyMsg, &replyInfo);
-            ESP_LOGI("APP", "Sent Reply: %s", responsePayload);
+            ESP_LOGI("APP", "Sent Config Reply to MTD");
         }
+        return; // Done, do not try to parse as binary
     }
-    // (Optional) Keep the old registration logic if you still want it
-    else if (strncmp((char *)buf, "mtd button", 10) == 0)
+
+    // --- CASE 2: Handle Binary Report (MAC + RSSI + Data) ---
+    // If it's NOT a request, and has enough length, treat it as data
+    if (length >= 7)
     {
-        ESP_LOGI("APP", "MTD Registered (Button Press)");
+        uint8_t *mac = buf;          // Bytes 0-5
+        int8_t rssi = (int8_t)buf[6]; // Byte 6
+        uint8_t *data = &buf[7];     // Byte 7+
+        uint16_t dataLen = length - 7;
+
+        // Generate Hex String for Data
+        char hexString[65];
+        for (int i = 0; i < dataLen && i < 31; i++) {
+            hexString[i*2]     = hexDigit(data[i] >> 4);
+            hexString[i*2 + 1] = hexDigit(data[i] & 0x0F);
+        }
+        hexString[dataLen * 2] = '\0';
+
+        // Print JSON
+        ESP_LOGI("APP", "{\"MAC\": \"%02X:%02X:%02X:%02X:%02X:%02X\", \"RSSI\": %d, \"Data\": \"%s\"}",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                 rssi,
+                 (dataLen > 0) ? hexString : "NotFound");
     }
 }
 
+
 // --- 2. Helper Function to Send (Modified for Unicast) ---
-
-
 // Change function signature to accept the payload string
 void send_command_helper(const char *command_string)
 {

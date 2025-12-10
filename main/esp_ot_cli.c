@@ -56,48 +56,69 @@ char hexDigit(uint8_t nibble) {
     return (nibble < 10) ? ('0' + nibble) : ('A' + nibble - 10);
 }
 
+// Define the 9 Target MACs for the "Real Event"
+const char *TARGET_MACS[] = {
+    "7CD9F41B47EB", // [0] Original
+    "7CD9F412CD63", // [1]
+    "7CD9F410E29F", // [2]
+    "7CD9F4117ADA", // [3]
+    "7CD9F41126CB", // [4]
+    "7CD9F410DECF", // [5]
+    "E466E53BB5AD", // [6]
+    "E4B323B4738E", // [7]
+    "84C2E4DCDE5B"  // [8]
+};
+#define NUM_TARGETS 9
+
 void handleUdpReceive(void *aContext, otMessage *aMessage, const otMessageInfo *aMessageInfo)
 {
     uint8_t buf[64];
     uint16_t length = otMessageRead(aMessage, otMessageGetOffset(aMessage), buf, sizeof(buf) - 1);
     buf[length] = '\0'; // Safety null-termination
 
-    // --- CASE 1: Handle Request ("REQ_MAC") ---
-    // If the packet text starts with "REQ_MAC"
+    // ==========================================================
+    // LOGIC 1: Handle Request from MTD ("REQ_MAC")
+    // ==========================================================
     if (length >= 7 && strncmp((char *)buf, "REQ_MAC", 7) == 0)
     {
-        ESP_LOGI("APP", "Received Request: REQ_MAC");
+        ESP_LOGI("APP", "Received Request: REQ_MAC. Sending %d targets...", NUM_TARGETS);
 
-        // Prepare Response: "SET_MAC:0:YOUR_TARGET_MAC"
-        // CHANGE THIS MAC ADDRESS TO YOUR REAL TARGET
-        char responsePayload[32];
-        snprintf(responsePayload, sizeof(responsePayload), "SET_MAC:0:%s", "7CD9F41B47EB");
-
-        // Send Reply
         otInstance *instance = esp_openthread_get_instance();
-        otMessage *replyMsg = otUdpNewMessage(instance, NULL);
-        if (replyMsg)
-        {
-            (void)otMessageAppend(replyMsg, responsePayload, strlen(responsePayload));
-            
-            otMessageInfo replyInfo;
-            memset(&replyInfo, 0, sizeof(replyInfo));
-            replyInfo.mPeerAddr = aMessageInfo->mPeerAddr; // Reply to sender
-            replyInfo.mPeerPort = 234; // MTD Port
 
-            (void)otUdpSend(instance, &sUdpSocket, replyMsg, &replyInfo);
-            ESP_LOGI("APP", "Sent Config Reply to MTD");
+        for (int i = 0; i < NUM_TARGETS; i++)
+        {
+            char responsePayload[32];
+            // Format: SET_MAC:Index:MAC (e.g., "SET_MAC:0:7CD9...")
+            snprintf(responsePayload, sizeof(responsePayload), "SET_MAC:%d:%s", i, TARGET_MACS[i]);
+
+            otMessage *replyMsg = otUdpNewMessage(instance, NULL);
+            if (replyMsg)
+            {
+                (void)otMessageAppend(replyMsg, responsePayload, strlen(responsePayload));
+                
+                otMessageInfo replyInfo;
+                memset(&replyInfo, 0, sizeof(replyInfo));
+                replyInfo.mPeerAddr = aMessageInfo->mPeerAddr; // Reply to sender
+                replyInfo.mPeerPort = 234; // MTD Port
+
+                (void)otUdpSend(instance, &sUdpSocket, replyMsg, &replyInfo);
+                
+                // Small delay to prevent queue flooding
+                usleep(20000); 
+            }
         }
-        return; // Done, do not try to parse as binary
+        ESP_LOGI("APP", "Sent All Targets.");
+        return; // Stop here (Don't try to parse REQ as Data)
     }
 
-    // --- CASE 2: Handle Binary Report (MAC + RSSI + Data) ---
-    // If it's NOT a request, and has enough length, treat it as data
+    // ==========================================================
+    // LOGIC 2: Handle Binary Data Report (PRINT LOG DATA)
+    // ==========================================================
     if (length >= 7)
     {
-        uint8_t *mac = buf;          // Bytes 0-5
+        uint8_t *mac = buf;           // Bytes 0-5
         int8_t rssi = (int8_t)buf[6]; // Byte 6
-        uint8_t *data = &buf[7];     // Byte 7+
+        uint8_t *data = &buf[7];      // Byte 7+
         uint16_t dataLen = length - 7;
 
         // Generate Hex String for Data
@@ -108,7 +129,7 @@ void handleUdpReceive(void *aContext, otMessage *aMessage, const otMessageInfo *
         }
         hexString[dataLen * 2] = '\0';
 
-        // Print JSON
+        // PRINT THE JSON LOG
         ESP_LOGI("APP", "{\"MAC\": \"%02X:%02X:%02X:%02X:%02X:%02X\", \"RSSI\": %d, \"Data\": \"%s\"}",
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
                  rssi,

@@ -1,302 +1,358 @@
-
 #include <stdio.h>
-#include <unistd.h>
 #include <string.h>
-
+#include <stdlib.h>
 #include "sdkconfig.h"
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
-#include "esp_netif_types.h"
-#include "esp_openthread.h"
-#include "esp_openthread_cli.h"
-#include "esp_openthread_lock.h"
-#include "esp_openthread_netif_glue.h"
-#include "esp_openthread_types.h"
-#include "esp_ot_config.h"
-#include "esp_vfs_eventfd.h"
-#include "driver/uart.h"
+#include "esp_timer.h"
+#include "nvs_flash.h"
+#include "mqtt_client.h"
+#include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/timers.h"
-#include "hal/uart_types.h"
-#include "nvs_flash.h"
-#include "openthread/cli.h"
-#include "openthread/instance.h"
-#include "openthread/logging.h"
-#include "openthread/tasklet.h"
-#include "openthread/udp.h"
-#include "openthread/ip6.h"
+#include "freertos/semphr.h"
+#include "esp_wifi.h"       
 
-#if CONFIG_OPENTHREAD_STATE_INDICATOR_ENABLE
-#include "ot_led_strip.h"
-#endif
+/* NimBLE Headers */
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+#include "host/util/util.h"
+#include "services/gap/ble_svc_gap.h"
 
-#if CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
-#include "esp_ot_cli_extension.h"
-#endif
+#define TAG "WIFI_BLE_GW"
 
-#define TAG "ot_esp_cli"
+// =============================================================
+// CONFIGURATION
+// =============================================================
+#define WIFI_SSID       "MyNet"      // <--- SET THIS
+#define WIFI_PASS       "Phayatha1234"  // <--- SET THIS
 
-#define MAX_MTD_COUNT 10
-#define MY_TARGET_BLE_MAC "AABBCCDDEEFF" // Your BLE Target
+#define MQTT_BROKER_URI "mqtt://mqtt.forthtrack.com" 
+#define MQTT_USERNAME   "tracking"
+#define MQTT_PASSWORD   "forth1234"
 
-static otUdpSocket sUdpSocket;
-static TimerHandle_t s_periodic_timer;
+#define MQTT_TOPIC_TARGETS "ble/targets/set"
+#define MQTT_TOPIC_REPORTS "ble/reports"
+#define REPORT_INTERVAL_MS 60000   // 1 Minute
+#define BLE_DATA_TIMEOUT_MS 120000 // 2 Minutes
+// =============================================================
 
-// --- GLOBAL VARIABLES FOR MULTI-UNICAST ---
-static otIp6Address sMtdList[MAX_MTD_COUNT]; // List of addresses
-static int sMtdCount = 0;                    // How many we found so far
-// ------------------------------------------
+// --- GLOBALS ---
+static esp_mqtt_client_handle_t s_mqtt_client = NULL;
+static bool s_mqtt_connected = false;
+static SemaphoreHandle_t s_data_mutex = NULL;
 
-// --- 1. UDP Receive Handler (Consolidated) ---
-// Helper to convert byte to hex digit
+// --- STORAGE ---
+#define MAX_TARGETS 20
+
+typedef struct {
+    char mac_str[13]; // Format: "AABBCCDDEEFF"
+    uint8_t mac_addr[6]; // Binary format {0xAA, 0xBB...}
+    int type;
+} ble_target_t;
+
+typedef struct {
+    int8_t rssi;
+    char data_hex[130]; 
+    bool has_data;
+    int64_t last_update_ms;
+} ble_cache_t;
+
+static ble_target_t s_ble_targets[MAX_TARGETS];
+static ble_cache_t s_ble_cache[MAX_TARGETS];
+static int s_num_targets = 0;
+
+// --- PROTOTYPES ---
+void ble_scan_start(void);
+
+// --- HELPERS ---
 char hexDigit(uint8_t nibble) {
     return (nibble < 10) ? ('0' + nibble) : ('A' + nibble - 10);
 }
 
-// Define the 9 Target MACs for the "Real Event"
-const char *TARGET_MACS[] = {
-    "7CD9F41B47EB", // [0] Original
-    "7CD9F412CD63", // [1]
-    "7CD9F410E29F", // [2]
-    "7CD9F4117ADA", // [3]
-    "7CD9F41126CB", // [4]
-    "7CD9F410DECF", // [5]
-    "E466E53BB5AD", // [6]
-    "E4B323B4738E", // [7]
-    "84C2E4DCDE5B"  // [8]
-};
-#define NUM_TARGETS 9
-
-void handleUdpReceive(void *aContext, otMessage *aMessage, const otMessageInfo *aMessageInfo)
-{
-    uint8_t buf[64];
-    uint16_t length = otMessageRead(aMessage, otMessageGetOffset(aMessage), buf, sizeof(buf) - 1);
-    buf[length] = '\0'; // Safety null-termination
-
-    // ==========================================================
-    // LOGIC 1: Handle Request from MTD ("REQ_MAC")
-    // ==========================================================
-    if (length >= 7 && strncmp((char *)buf, "REQ_MAC", 7) == 0)
-    {
-        ESP_LOGI("APP", "Received Request: REQ_MAC. Sending %d targets...", NUM_TARGETS);
-
-        otInstance *instance = esp_openthread_get_instance();
-
-        for (int i = 0; i < NUM_TARGETS; i++)
-        {
-            char responsePayload[32];
-            // Format: SET_MAC:Index:MAC (e.g., "SET_MAC:0:7CD9...")
-            snprintf(responsePayload, sizeof(responsePayload), "SET_MAC:%d:%s", i, TARGET_MACS[i]);
-
-            otMessage *replyMsg = otUdpNewMessage(instance, NULL);
-            if (replyMsg)
-            {
-                (void)otMessageAppend(replyMsg, responsePayload, strlen(responsePayload));
-                
-                otMessageInfo replyInfo;
-                memset(&replyInfo, 0, sizeof(replyInfo));
-                replyInfo.mPeerAddr = aMessageInfo->mPeerAddr; // Reply to sender
-                replyInfo.mPeerPort = 234; // MTD Port
-
-                (void)otUdpSend(instance, &sUdpSocket, replyMsg, &replyInfo);
-                
-                // Small delay to prevent queue flooding
-                usleep(20000); 
-            }
-        }
-        ESP_LOGI("APP", "Sent All Targets.");
-        return; // Stop here (Don't try to parse REQ as Data)
-    }
-
-    // ==========================================================
-    // LOGIC 2: Handle Binary Data Report (PRINT LOG DATA)
-    // ==========================================================
-    if (length >= 7)
-    {
-        uint8_t *mac = buf;           // Bytes 0-5
-        int8_t rssi = (int8_t)buf[6]; // Byte 6
-        uint8_t *data = &buf[7];      // Byte 7+
-        uint16_t dataLen = length - 7;
-
-        // Generate Hex String for Data
-        char hexString[65];
-        for (int i = 0; i < dataLen && i < 31; i++) {
-            hexString[i*2]     = hexDigit(data[i] >> 4);
-            hexString[i*2 + 1] = hexDigit(data[i] & 0x0F);
-        }
-        hexString[dataLen * 2] = '\0';
-
-        // PRINT THE JSON LOG
-        ESP_LOGI("APP", "{\"MAC\": \"%02X:%02X:%02X:%02X:%02X:%02X\", \"RSSI\": %d, \"Data\": \"%s\"}",
-                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-                 rssi,
-                 (dataLen > 0) ? hexString : "NotFound");
+// Convert String MAC "AABB..." to Binary {0xAA, 0xBB...}
+void parse_mac_string(const char *str, uint8_t *out_addr) {
+    for (int i = 0; i < 6; i++) {
+        char buf[3] = {str[i*2], str[i*2+1], 0};
+        out_addr[i] = (uint8_t)strtol(buf, NULL, 16);
     }
 }
 
+// --- NIMBLE SCAN EVENT HANDLER (CORRECTED) ---
+static int ble_gap_event(struct ble_gap_event *event, void *arg) {
+    switch (event->type) {
+        case BLE_GAP_EVENT_DISC: {
+            if (xSemaphoreTake(s_data_mutex, 0) == pdTRUE) {
+                for (int i = 0; i < s_num_targets; i++) {
+                    bool match = true;
+                    // Check MAC
+                    for(int k=0; k<6; k++) {
+                        if (s_ble_targets[i].mac_addr[k] != event->disc.addr.val[5-k]) {
+                            match = false;
+                            break;
+                        }
+                    }
 
-// --- 2. Helper Function to Send (Modified for Unicast) ---
-// Change function signature to accept the payload string
-void send_command_helper(const char *command_string)
-{
-    otInstance *instance = esp_openthread_get_instance();
-    otMessage *message = NULL;
-    otMessageInfo messageInfo;
-    otError error;
+                    if (match) {
+                        // 1. ALWAYS Update RSSI & Timestamp (Presence is valid even without data)
+                        s_ble_cache[i].rssi = event->disc.rssi;
+                        s_ble_cache[i].has_data = true;
+                        s_ble_cache[i].last_update_ms = esp_timer_get_time() / 1000;
 
-    // 1. Send to Sleepy FTD (Multicast still works fine for Router/FTD)
-    // ... (Keep your existing FTD multicast code here if you want) ...
+                        // 2. ONLY Update Data if Length > 0 (Prevent overwriting with empty strings)
+                        if (event->disc.length_data > 0) {
+                            int len = event->disc.length_data;
+                            if (len > 64) len = 64; 
 
-    // 2. Send UNICAST to ALL Sleepy MTDs
-    if (sMtdCount > 0)
-    {
-        ESP_LOGI("APP", "Sending to %d MTDs...", sMtdCount);
+                            for (int k = 0; k < len; k++) {
+                                s_ble_cache[i].data_hex[k*2]     = hexDigit(event->disc.data[k] >> 4);
+                                s_ble_cache[i].data_hex[k*2 + 1] = hexDigit(event->disc.data[k] & 0x0F);
+                            }
+                            s_ble_cache[i].data_hex[len * 2] = '\0';
+                            
+                            // Log only when we get new data
+                            ESP_LOGI(TAG, "MATCH! MAC: %s | RSSI: %d | Data Len: %d", 
+                                     s_ble_targets[i].mac_str, event->disc.rssi, len);
+                        } else {
+                             ESP_LOGD(TAG, "MATCH! MAC: %s (Empty Packet - Kept Old Data)", s_ble_targets[i].mac_str);
+                        }
+                        break; 
+                    }
+                }
+                xSemaphoreGive(s_data_mutex);
+            }
+            break;
+        }
 
-        // Loop through every known MTD
-        for (int i = 0; i < sMtdCount; i++)
-        {
-            message = otUdpNewMessage(instance, NULL);
-            if (message) {
-                (void)otMessageAppend(message, command_string, strlen(command_string));
-                
-                memset(&messageInfo, 0, sizeof(messageInfo));
-                
-                // Set Destination to the saved address from the list
-                messageInfo.mPeerAddr = sMtdList[i]; 
-                messageInfo.mPeerPort = 234; 
+        case BLE_GAP_EVENT_DISC_COMPLETE:
+            ble_scan_start(); 
+            break;
+            
+        default:
+            break;
+    }
+    return 0;
+}
 
-                error = otUdpSend(instance, &sUdpSocket, message, &messageInfo);
-                
-                if (error != OT_ERROR_NONE) {
-                    otMessageFree(message);
-                    ESP_LOGE("APP", "Failed to send to MTD #%d", i);
+void ble_scan_start(void) {
+    uint8_t own_addr_type;
+    struct ble_gap_disc_params disc_params;
+    int rc;
+
+    ble_hs_id_infer_auto(0, &own_addr_type);
+
+    memset(&disc_params, 0, sizeof(disc_params));
+    disc_params.filter_duplicates = 0; // Don't filter, we handle caching manually
+    disc_params.passive = 0;           // Active scan to get scan response data
+    disc_params.itvl = 0;              // Default interval
+    disc_params.window = 0;            // Default window
+
+    // Scan for 10 seconds (10000ms), then restart in callback
+    rc = ble_gap_disc(own_addr_type, 10000, &disc_params, ble_gap_event, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Error initiating GAP discovery; rc=%d", rc);
+    }
+}
+
+// --- MQTT EVENT HANDLER ---
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
+    esp_mqtt_event_handle_t event = event_data;
+    switch (event->event_id) {
+        case MQTT_EVENT_CONNECTED:
+            ESP_LOGI(TAG, "MQTT Connected");
+            s_mqtt_connected = true;
+            esp_mqtt_client_subscribe(s_mqtt_client, MQTT_TOPIC_TARGETS, 1);
+            break;
+        case MQTT_EVENT_DISCONNECTED:
+             ESP_LOGI(TAG, "MQTT Disconnected");
+             s_mqtt_connected = false;
+             break;
+        case MQTT_EVENT_DATA:
+            if (strncmp(event->topic, MQTT_TOPIC_TARGETS, event->topic_len) == 0) {
+                ESP_LOGI(TAG, "Received New Targets List");
+                cJSON *root = cJSON_ParseWithLength(event->data, event->data_len);
+                if (root && cJSON_IsArray(root)) {
+                    if (xSemaphoreTake(s_data_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                        s_num_targets = 0;
+                        int count = cJSON_GetArraySize(root);
+                        for (int i = 0; i < count && i < MAX_TARGETS; i++) {
+                            cJSON *item = cJSON_GetArrayItem(root, i);
+                            cJSON *mac = cJSON_GetObjectItem(item, "MAC");
+                            cJSON *type = cJSON_GetObjectItem(item, "Type");
+                            if (cJSON_IsString(mac)) {
+                                // 1. Store String (Stripping Colons)
+                                const char *src = mac->valuestring;
+                                char *dst = s_ble_targets[i].mac_str;
+                                int k = 0;
+                                for (int j = 0; src[j] != '\0' && k < 12; j++) {
+                                    if (src[j] != ':') dst[k++] = src[j];
+                                }
+                                dst[k] = '\0';
+                                
+                                // 2. Store Binary (For Scan Matching)
+                                parse_mac_string(s_ble_targets[i].mac_str, s_ble_targets[i].mac_addr);
+
+                                s_ble_targets[i].type = cJSON_IsNumber(type) ? type->valueint : 0;
+                                s_ble_cache[i].has_data = false; 
+                                s_num_targets++;
+                            }
+                        }
+                        xSemaphoreGive(s_data_mutex);
+                        ESP_LOGI(TAG, "Updated %d targets.", s_num_targets);
+                    }
+                    cJSON_Delete(root);
                 }
             }
+            break;
+        default: break;
+    }
+}
+
+// --- WIFI HANDLER ---
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGI(TAG, "WiFi Disconnected. Retrying...");
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+    }
+}
+
+// --- WORKER TASK: PERIODIC REPORT ---
+static void periodic_worker_task(void *pvParameters) {
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000)); // Check every second
+
+        static int report_timer = 0;
+        report_timer += 1000;
+        
+        // Report every 60 seconds (REPORT_INTERVAL_MS)
+        if (report_timer >= REPORT_INTERVAL_MS) {
+            report_timer = 0;
+
+            if (xSemaphoreTake(s_data_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+                int64_t now = esp_timer_get_time() / 1000;
+
+                // 1. CLEANUP OLD BLE DATA (Timeout > 2 mins)
+                for (int i = 0; i < s_num_targets; i++) {
+                    if (s_ble_cache[i].has_data) {
+                        if ((now - s_ble_cache[i].last_update_ms) > BLE_DATA_TIMEOUT_MS) {
+                            s_ble_cache[i].has_data = false; 
+                            ESP_LOGW(TAG, "Target %s timed out (no data for 2 mins)", s_ble_targets[i].mac_str);
+                        }
+                    }
+                }
+
+                // 2. BUILD JSON
+                cJSON *root = cJSON_CreateObject();
+                cJSON *report_array = cJSON_CreateArray();
+                
+                for (int i = 0; i < s_num_targets; i++) {
+                    cJSON *item = cJSON_CreateObject();
+                    cJSON_AddStringToObject(item, "MAC", s_ble_targets[i].mac_str);
+
+                    if (s_ble_cache[i].has_data) {
+                        // Add RSSI as Number
+                        cJSON_AddNumberToObject(item, "RSSI", s_ble_cache[i].rssi);
+                        cJSON_AddStringToObject(item, "Data", s_ble_cache[i].data_hex);
+                        // Add timestamp of last seen (optional, useful for debugging)
+                        cJSON_AddNumberToObject(item, "ts", (double)s_ble_cache[i].last_update_ms);
+                    } else {
+                        cJSON_AddNumberToObject(item, "RSSI", -100);
+                        cJSON_AddStringToObject(item, "Data", "NotFound");
+                    }
+                    cJSON_AddItemToArray(report_array, item);
+                }
+                cJSON_AddItemToObject(root, "reports", report_array);
+
+                // 3. PUBLISH
+                if (s_mqtt_connected && s_num_targets > 0) {
+                    char *json_str = cJSON_PrintUnformatted(root);
+                    if (json_str) {
+                        // --- DEBUG: Print JSON to Console ---
+                        printf(">> REPORT JSON: %s\n", json_str); 
+                        // ------------------------------------
+                        
+                        esp_mqtt_client_publish(s_mqtt_client, MQTT_TOPIC_REPORTS, json_str, 0, 0, 0);
+                        free(json_str);
+                    }
+                }
+                cJSON_Delete(root);
+                xSemaphoreGive(s_data_mutex);
+            }
         }
     }
-    else
-    {
-        ESP_LOGW("APP", "No MTDs found yet. Press button on MTDs to register.");
-    }
 }
 
-// --- 3. FreeRTOS Timer Callback ---
-void vPeriodicTimerCallback(TimerHandle_t xTimer)
-{
-/*    if (esp_openthread_lock_acquire(portMAX_DELAY))
-    {
-        send_command_helper("LED:1");
-        esp_openthread_lock_release();
-    }*/
-}
-
-// --- 4. Initialization Function ---
-void init_custom_multicast(otInstance *instance)
-{
-    otError error;
-    otSockAddr bindAddr;
-    otIp6Address multicastAddr;
-
-    // Listen on ff03::1 so we can hear the MTD's broadcast
-    (void)otIp6AddressFromString("ff03::1", &multicastAddr);
-    (void)otIp6SubscribeMulticastAddress(instance, &multicastAddr);
-
-    memset(&bindAddr, 0, sizeof(bindAddr));
-    bindAddr.mPort = 123;
-
-    (void)otUdpOpen(instance, &sUdpSocket, handleUdpReceive, NULL);
-    (void)otUdpBind(instance, &sUdpSocket, &bindAddr, OT_NETIF_THREAD);
+// --- INIT FUNCTIONS ---
+void wifi_init(void) {
+    ESP_ERROR_CHECK(esp_netif_init());
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     
-    ESP_LOGI("APP", "Listening on ff03::1 port 123. Waiting for MTD...");
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
 
-    // Start Timer
-    s_periodic_timer = xTimerCreate("PeriodicTx", pdMS_TO_TICKS(5000), pdTRUE, (void *)0, vPeriodicTimerCallback);
-    if (s_periodic_timer != NULL) {
-        xTimerStart(s_periodic_timer, 0);
-    }
-}
-
-static esp_netif_t *init_openthread_netif(const esp_openthread_platform_config_t *config)
-{
-    esp_netif_config_t cfg = ESP_NETIF_DEFAULT_OPENTHREAD();
-    esp_netif_t *netif = esp_netif_new(&cfg);
-    assert(netif != NULL);
-    ESP_ERROR_CHECK(esp_netif_attach(netif, esp_openthread_netif_glue_init(config)));
-
-    return netif;
-}
-
-static void ot_task_worker(void *aContext)
-{
-    esp_openthread_platform_config_t config = {
-        .radio_config = ESP_OPENTHREAD_DEFAULT_RADIO_CONFIG(),
-        .host_config = ESP_OPENTHREAD_DEFAULT_HOST_CONFIG(),
-        .port_config = ESP_OPENTHREAD_DEFAULT_PORT_CONFIG(),
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
     };
-
-    // Initialize the OpenThread stack
-    ESP_ERROR_CHECK(esp_openthread_init(&config));
-
-#if CONFIG_OPENTHREAD_STATE_INDICATOR_ENABLE
-    ESP_ERROR_CHECK(esp_openthread_state_indicator_init(esp_openthread_get_instance()));
-#endif
-
-#if CONFIG_OPENTHREAD_LOG_LEVEL_DYNAMIC
-    // The OpenThread log level directly matches ESP log level
-    (void)otLoggingSetLevel(CONFIG_LOG_DEFAULT_LEVEL);
-#endif
-    // Initialize the OpenThread cli
-#if CONFIG_OPENTHREAD_CLI
-    esp_openthread_cli_init();
-#endif
-
-    esp_netif_t *openthread_netif;
-    // Initialize the esp_netif bindings
-    openthread_netif = init_openthread_netif(&config);
-    esp_netif_set_default_netif(openthread_netif);
-    
-    // --- Initialize Custom Multicast & Timer ---
-    init_custom_multicast(esp_openthread_get_instance());
-
-#if CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
-    esp_cli_custom_command_init();
-#endif // CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
-
-    // Run the main loop
-#if CONFIG_OPENTHREAD_CLI
-    esp_openthread_cli_create_task();
-#endif
-#if CONFIG_OPENTHREAD_AUTO_START
-    otOperationalDatasetTlvs dataset;
-    otError error = otDatasetGetActiveTlvs(esp_openthread_get_instance(), &dataset);
-    ESP_ERROR_CHECK(esp_openthread_auto_start((error == OT_ERROR_NONE) ? &dataset : NULL));
-#endif
-    esp_openthread_launch_mainloop();
-
-    // Clean up
-    esp_openthread_netif_glue_deinit();
-    esp_netif_destroy(openthread_netif);
-
-    esp_vfs_eventfd_unregister();
-    vTaskDelete(NULL);
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
 }
 
-void app_main(void)
-{
-    // Used eventfds:
-    // * netif
-    // * ot task queue
-    // * radio driver
-    esp_vfs_eventfd_config_t eventfd_config = {
-        .max_fds = 3,
-    };
+void ble_app_on_sync(void) {
+    int rc;
+    rc = ble_hs_util_ensure_addr(0);
+    assert(rc == 0);
+    ESP_LOGI(TAG, "[BLE] Stack Synced. Starting Scan...");
+    ble_scan_start();
+}
 
+void nimble_host_task(void *param) {
+    nimble_port_run();
+    nimble_port_freertos_deinit();
+}
+
+void ble_init(void) {
+    // NimBLE Initialization
+    nimble_port_init();
+    ble_hs_cfg.sync_cb = ble_app_on_sync;
+    nimble_port_freertos_init(nimble_host_task);
+}
+
+static void mqtt_start(void) {
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = MQTT_BROKER_URI,
+        .credentials.username = MQTT_USERNAME,
+        .credentials.authentication.password = MQTT_PASSWORD,
+    };
+    s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(s_mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(s_mqtt_client);
+}
+
+void app_main(void) {
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_vfs_eventfd_register(&eventfd_config));
-    xTaskCreate(ot_task_worker, "ot_cli_main", 10240, xTaskGetCurrentTaskHandle(), 5, NULL);
+    
+    s_data_mutex = xSemaphoreCreateMutex();
+
+    ESP_LOGI(TAG, "System Init...");
+    wifi_init();
+    ble_init();
+    mqtt_start();
+
+    xTaskCreate(periodic_worker_task, "worker_task", 4096, NULL, 5, NULL);
 }

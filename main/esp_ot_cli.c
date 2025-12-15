@@ -27,8 +27,11 @@
 // =============================================================
 // CONFIGURATION
 // =============================================================
-#define WIFI_SSID       "MyNet"      // <--- SET THIS
-#define WIFI_PASS       "Phayatha1234"  // <--- SET THIS
+/*#define WIFI_SSID       "MyNet"      
+#define WIFI_PASS       "Phayatha1234"  */
+
+#define WIFI_SSID       "JetsonAP"      
+#define WIFI_PASS       "12345678" 
 
 #define MQTT_BROKER_URI "mqtt://mqtt.forthtrack.com" 
 #define MQTT_USERNAME   "tracking"

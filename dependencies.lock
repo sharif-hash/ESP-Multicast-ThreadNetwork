@@ -50,5 +50,5 @@ direct_dependencies:
 - idf
 - ot_led
 manifest_hash: 963824e0a62a27ce0c2b82c605b67acbe18d1e3adb4ad12c98b0302b37ad6174
-target: esp32c6
+target: esp32s3
 version: 2.0.0
